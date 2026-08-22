@@ -30,10 +30,11 @@ F1_LapTime_Prediction/
 │   ├── evaluate.py        # --experiment {wind,wind-cross-domain,temp,temp-cross-domain} --model {dt,rf,xgb,all} [--no-plots | --save-plots-dir DIR]
 │   ├── summarize.py       # parse logs/*.log → summary/metrics.csv + summary/best_params.csv
 │   ├── mechanism.py       # PDP/ICE figures + symmetric undercut scenarios
+│   ├── export_pdp_cache.py # RF PDP curves → demo/pdp_cache.json (lets the demo run model-free)
 │   └── diagrams.py        # English architecture + research-flow diagrams (matplotlib, → docs/img/)
 ├── tests/                 # pytest suite (synthetic fixtures — no race data or network needed)
 ├── notebooks/             # 01_eda.ipynb (data-only EDA) + 02_walkthrough.ipynb (pretrained models; no training/network)
-├── demo/                  # Streamlit undercut demo (pip install -e .[demo]; streamlit run demo/app.py)
+├── demo/                  # pdp_cache.json (exported PDP curves) + demo notes; the app is ./app.py
 ├── docs/img/              # committed English diagrams (exempt from the global *.png ignore)
 ├── data/                  # gitignored: raw/ + merged/
 ├── models/                # gitignored: *.joblib (full run produces 6 files)
@@ -41,7 +42,8 @@ F1_LapTime_Prediction/
 ├── summary/               # gitignored: metrics.csv + best_params.csv (from summarize.py)
 ├── plots/                 # gitignored: diagnostic + PDP/ICE PNGs
 ├── legacy/                # READ-ONLY frozen snapshot: original .joblib + standalone scripts
-├── run.py                 # one-command full pipeline (python run.py; --dry-run previews)
+├── app.py                 # Streamlit undercut demo (OOD-refusal UX; reads demo/pdp_cache.json)
+├── main.py                 # one-command full pipeline (python main.py; --dry-run previews)
 ├── pyproject.toml         # packaging (pip install -e .) + ruff config
 ├── requirements.txt       # exact pinned dependency lock
 ├── .gitignore
@@ -73,7 +75,7 @@ Install: `pip install -r requirements.txt` (exact locked versions) or `pip insta
 
 ### Full symmetric run (6 trainings + 24 evaluations + 1 summary + 1 mechanism)
 
-`python run.py` executes the full 32-command sequence (`--dry-run` prints it without running). Structure:
+`python main.py` executes the full 32-command sequence (`--dry-run` prints it without running). Structure:
 
 - **6 training runs** (3 models × 2 studies): DT, RF, XGB on Azerbaijan and Singapore training data
 - **24 evaluation runs** (3 models × 4 conditions × 2 studies): each model evaluated on in-domain + cross-domain × raw + bias-corrected
@@ -89,9 +91,9 @@ Estimated wall-clock on 8-core CPU:
 | XGB | 2,160 | ~10-13 h | ~20-26 h |
 | **Sum** | | | **~75-80 h** |
 
-DT is intentionally first in `run.py`'s `MODELS` list to act as a fast pipeline sanity check before committing 16+ hours to RF.
+DT is intentionally first in `main.py`'s `MODELS` list to act as a fast pipeline sanity check before committing 16+ hours to RF.
 
-Both `train.py` and `evaluate.py` support `--save-plots-dir DIR` (mutually exclusive with `--no-plots`), and `run.py` uses it for all 30 train/evaluate commands. After a full run, `plots/` contains:
+Both `train.py` and `evaluate.py` support `--save-plots-dir DIR` (mutually exclusive with `--no-plots`), and `main.py` uses it for all 30 train/evaluate commands. After a full run, `plots/` contains:
 
 - **18 PNG from training** (6 trained models × 3 plot types — feature_importance, prediction_vs_actual, residual_distribution on the validation set), filename `train_{study}_{model}_<type>.png`
 - **216 PNG from evaluation** (24 evals × 9 plot types — prediction_vs_actual, residual_distribution, residual_vs_predicted, residual_vs_feature×6 on the test set), filename `eval_{study}_{domain}_{mode}_{model}_<type>.png`
@@ -159,7 +161,7 @@ Steps in `fit()`:
 
 Public surface: `fit()`, `predict_valid()`, `report()`, `save(path)`, `is_fitted`, `cv_results_`, `best_params`, `model_name`.
 
-`Metrics` dataclass (returned by `report()` and stored in `EvaluationResult`) carries 4 fields: `mae`, `mse`, `rmse` (= `sqrt(mse)`, in seconds — same unit as the target), and `r2`. `Metrics.compute(y_true, y_pred)` is the single construction point; `report()` prints all four at `.3f` precision. `DEFAULT_MODEL` (ClassVar on `ModelTrainer`) is `"xgb"` — applies only when `model_name=` is omitted from the `ModelTrainer` constructor; both `train.py` and `evaluate.py` CLI default to `"all"`, and `run.py` always specifies the model explicitly. `ModelTrainer(..., quick=True)` swaps the tiny smoke grids in via `get_model_spec(name, quick=True)`.
+`Metrics` dataclass (returned by `report()` and stored in `EvaluationResult`) carries 4 fields: `mae`, `mse`, `rmse` (= `sqrt(mse)`, in seconds — same unit as the target), and `r2`. `Metrics.compute(y_true, y_pred)` is the single construction point; `report()` prints all four at `.3f` precision. `DEFAULT_MODEL` (ClassVar on `ModelTrainer`) is `"xgb"` — applies only when `model_name=` is omitted from the `ModelTrainer` constructor; both `train.py` and `evaluate.py` CLI default to `"all"`, and `main.py` always specifies the model explicitly. `ModelTrainer(..., quick=True)` swaps the tiny smoke grids in via `get_model_spec(name, quick=True)`.
 
 ### Model specifications (`f1lab/models.py`)
 
@@ -232,6 +234,8 @@ Per-lap correction term: `Δ = f(current_value) − f(training_mean)`, read off 
 `net`, `gap`, and the *uncorrected* decision are always computed (pure arithmetic / strategy params — not model-dependent); only the **correction term and the corrected gap** depend on in-support. This is the precise meaning of "OOD → withheld": gap is never refused, the correction is.
 
 The two studies instantiate the SAME class with IDENTICAL fixed params (`pit_loss=20.0, gap=19.50, out=95.2, in=95.5, N=10`); they differ only in the in-support (wind/Saudi) vs OOD (temp/Las Vegas) verdict — see "PDP/ICE figures + strategy scenarios" below.
+
+The model is touched **exactly once**, in `__init__`, to build the PDP grid; `evaluate()` afterwards reads only that grid, `support`, and `training_mean` (both stored at construction). `to_cache()` exports those model-derived values as plain JSON types and `from_cache()` rebuilds an equivalent scenario without a model — verified field-for-field identical (all 20 `ScenarioResult` fields) against the model path on both studies. `scripts/export_pdp_cache.py` writes `demo/pdp_cache.json` (6.7 KB: 100 HeadWind grid points, 49 TrackTemp), which is what the Streamlit app loads — so the deployed demo ships no `.joblib` and no race data, and boots in seconds instead of recomputing a ~1 min RF PDP. **Re-run the export after any retrain**, or the demo keeps showing the previous model's PDP.
 
 ## Feature engineering
 
